@@ -12,6 +12,7 @@ from hio import help
 from hio.help import helping
 from hio.base import tyming, doing
 from hio.core import http
+from hio.core.http import serving, httping
 
 
 logger = help.ogler.getLogger()
@@ -313,5 +314,146 @@ def test_server_client_doers():
     """End Test """
 
 
+def test_requestant_max_body_known_length():
+    """
+    Test Requestant.parseBody rejects a known content-length body that exceeds
+    the configured maximum size, instead of buffering it all into
+    memory. Drives parseBody directly with a crafted oversized msg.
+    """
+    maxBody = 100
+    oversized = bytearray(b'x' * (maxBody + 1))  # 101 bytes, over the limit
+
+    req = serving.Requestant(msg=bytearray(oversized))
+    req.maxBody = maxBody  # per-instance cap (ignored by unfixed code)
+    req.chunked = False
+    req.length = len(oversized)  # declared content-length exceeds maxBody
+    req.headed = True
+
+    with pytest.raises(httping.HTTPException) as exc:
+        for _ in req.parseBody():
+            pass
+
+    assert exc.value.status == 413  # Request Entity Too Large
+    # memory bounded: an over-limit declared length is rejected before buffering
+    assert len(req.body) <= maxBody
+    assert not req.bodied  # never completed parsing the oversized body
+    """End Test"""
+
+
+def test_requestant_max_body_chunked():
+    """
+    Test Requestant.parseBody bounds memory on a chunked body whose accumulated
+    chunks exceed the configured maximum size, even though chunked transfer has
+    no declared content-length. Stops and raises 413 during accumulation.
+    """
+    maxBody = 100
+    chunkData = b'a' * 50
+    chunkHex = format(len(chunkData), 'x').encode('ascii')  # b'32'
+    oneChunk = chunkHex + b'\r\n' + chunkData + b'\r\n'
+    # three 50-byte chunks (150 bytes total) then the terminating empty chunk
+    msg = bytearray(oneChunk * 3 + b'0\r\n\r\n')
+
+    req = serving.Requestant(msg=msg)
+    req.maxBody = maxBody
+    req.chunked = True
+    req.length = None
+    req.headed = True
+
+    with pytest.raises(httping.HTTPException) as exc:
+        for _ in req.parseBody():
+            pass
+
+    assert exc.value.status == 413
+    # memory bounded: accumulation stopped at/below the cap, not the full 150
+    assert len(req.body) <= maxBody
+    assert not req.bodied
+    """End Test"""
+
+
+def test_requestant_body_under_max_body():
+    """
+    Test Requestant.parseBody parses a body under the limit identically to
+    legacy behavior (pure addition: under-limit requests are unaffected).
+    """
+    body = b'hello world'
+    req = serving.Requestant(msg=bytearray(body), maxBody=100)
+    req.chunked = False
+    req.length = len(body)
+    req.headed = True
+
+    for _ in req.parseBody():
+        pass
+
+    assert req.body == body
+    assert req.bodied
+    assert req.length == len(body)
+    """End Test"""
+
+
+def test_requestant_max_body_config():
+    """
+    Test the MaxBody knob: sane generous default, configurable per instance,
+    and 0/None means unlimited (opt out to preserve legacy unbounded behavior).
+    """
+    # default: class attribute, at least a few MiB, and used when not overridden
+    assert serving.Requestant.MaxBody >= 1024 * 1024  # generous default (>= 1 MiB)
+    req = serving.Requestant()
+    assert req.maxBody == serving.Requestant.MaxBody
+
+    data = b'x' * 500
+
+    # a small cap rejects an over-limit body
+    req = serving.Requestant(msg=bytearray(data), maxBody=100)
+    req.chunked = False
+    req.length = len(data)
+    req.headed = True
+    with pytest.raises(httping.HTTPException) as exc:
+        for _ in req.parseBody():
+            pass
+    assert exc.value.status == 413
+
+    # maxBody == 0 disables the cap (unlimited) so the same body parses
+    req = serving.Requestant(msg=bytearray(data), maxBody=0)
+    req.chunked = False
+    req.length = len(data)
+    req.headed = True
+    for _ in req.parseBody():
+        pass
+    assert req.body == data
+    assert req.bodied
+    """End Test"""
+
+
+def test_max_body_server_plumbing():
+    """
+    Test the maxBody knob is accepted and stored by the WSGI Server and the
+    BareServer, and is passed through Steward to its Requestant.
+    """
+    def app(environ, start_response):  # minimal wsgi app
+        start_response("200 OK", [])
+        return [b""]
+
+    server = serving.Server(app=app, port=8080, maxBody=12345)
+    assert server.maxBody == 12345
+    server.servant.close()
+
+    bare = serving.BareServer(port=8081, maxBody=6789)
+    assert bare.maxBody == 6789
+    bare.servant.close()
+
+    # Steward forwards maxBody to the Requestant it creates
+    class FakeRemoter:
+        def __init__(self):
+            self.rxbs = bytearray()
+    steward = serving.Steward(remoter=FakeRemoter(), maxBody=222)
+    assert steward.requestant.maxBody == 222
+    """End Test"""
+
+
 if __name__ == '__main__':
     test_server_client_doers()
+    test_requestant_max_body_known_length()
+    test_requestant_max_body_chunked()
+    test_requestant_body_under_max_body()
+    test_requestant_max_body_config()
+    test_max_body_server_plumbing()

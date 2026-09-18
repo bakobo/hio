@@ -200,6 +200,27 @@ class PrematureClosure(HTTPException):
         self.args = msg,
         self.msg = msg
 
+class RequestEntityTooLarge(HTTPException):
+    """
+    Raised when a request body exceeds the configured maximum size, either by
+    a declared content-length or by bytes accumulated while parsing. Carries
+    HTTP status 413 so the request is rejected instead of buffering an unbounded
+    body into memory.
+    """
+    status = REQUEST_ENTITY_TOO_LARGE  # 413
+
+    def __init__(self, maxBody, size=None):
+        if size is None:
+            detail = ("Request body exceeds maximum allowed size of {0} bytes"
+                      .format(maxBody))
+        else:
+            detail = ("Request body size {0} exceeds maximum allowed size of "
+                      "{1} bytes".format(size, maxBody))
+        HTTPException.__init__(self, detail)
+        self.status = REQUEST_ENTITY_TOO_LARGE
+        self.maxBody = maxBody
+        self.size = size
+
 
 class HTTPError(Exception):
     """

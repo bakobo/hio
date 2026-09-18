@@ -36,16 +36,29 @@ class Requestant(httping.Parsent):
     Nonblocking HTTP Server Requestant class
     Parses request msg
     """
+    MaxBody = 4194304  # 4 MiB default maximum request body size in bytes.
+                       # A declared content-length above this, or accumulated
+                       # body bytes exceeding it, is rejected with status 413
+                       # before/while buffering to bound memory use.
+                       # Set the maxBody param to 0 (or None mapped to it) to
+                       # disable the limit and restore unbounded legacy behavior.
 
-    def __init__(self, remoter=None, **kwa):
+    def __init__(self, remoter=None, maxBody=None, **kwa):
         """
         Initialize Instance
         Parameters:
             remoter = Remoter incoming connection instance
+            maxBody = maximum allowed request body size in bytes. Requests whose
+                declared content-length or accumulated body exceeds this are
+                rejected with httping.RequestEntityTooLarge (status 413) instead
+                of being buffered into memory. If None, the class attribute
+                .MaxBody default is used. A value of 0 disables the limit
+                (unlimited), preserving legacy behavior for callers who opt out.
 
         """
         super(Requestant, self).__init__(**kwa)
         self.remoter = remoter
+        self.maxBody = self.MaxBody if maxBody is None else maxBody
         self.url = u''   # full path in request line either relative or absolute
         self.scheme = u''  # scheme used in request line path
         self.hostname = u''  # hostname used in request line path
@@ -220,6 +233,11 @@ class Requestant(httping.Parsent):
                     self.parms.update(parms)
 
                 if size:  # size non zero so append chunk but keep iterating
+                    # bound memory: reject before accumulating past the limit,
+                    # since chunked transfer has no declared content-length
+                    if self.maxBody and len(self.body) + size > self.maxBody:
+                        raise httping.RequestEntityTooLarge(maxBody=self.maxBody,
+                                                    size=len(self.body) + size)
                     self.body.extend(chunk)
 
                     if self.closed:  # no more data so finish
@@ -233,6 +251,10 @@ class Requestant(httping.Parsent):
                     break
 
         elif self.length != None:  # known content length
+            # reject an over-limit declared content-length without reading body
+            if self.maxBody and self.length > self.maxBody:
+                raise httping.RequestEntityTooLarge(maxBody=self.maxBody,
+                                                    size=self.length)
             while len(self.msg) < self.length:
                 if self.closed:  # connection closed prematurely
                     raise httping.PrematureClosure("Connection closed unexpectedly"
@@ -528,6 +550,7 @@ class Server():
                  eha=None,
                  scheme=u'',
                  tymeout=None,
+                 maxBody=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -551,9 +574,14 @@ class Server():
                 for servant and WSGI environment
             kwa needed to pass additional parameters to servant
             tymeout is tymeout in seconds for dropping idle connections
+            maxBody is maximum allowed request body size in bytes for each
+                Requestant. None uses the Requestant.MaxBody default; 0 disables
+                the limit (unlimited). Over-limit requests are rejected with
+                status 413 before/while buffering to bound memory use.
 
         Attributes:
             .app is wsgi application callable
+            .maxBody is maximum allowed request body size in bytes for requestants
             .reqs is dict of Requestant instances keyed by ca
             .reps is dict of running Wsgi Responder instances keyed by ca
             .servant is instance of Server or ServerTls or None
@@ -568,6 +596,7 @@ class Server():
         self.reqs.clear()  # items should only be assigned by valet
         self.reps = reps if reps is not None else dict()  # allows external view
         self.reps.clear()  # items should only be assigned by valet
+        self.maxBody = maxBody  # max request body size for requestants (bytes)
 
         if tymeout is None:
             tymeout = self.Tymeout
@@ -745,7 +774,8 @@ class Server():
                 continue
 
             if ca not in self.reqs:  # point requestant.msg to incomer.rxbs
-                self.reqs[ca] = Requestant(msg=ix.rxbs, remoter=ix)
+                self.reqs[ca] = Requestant(msg=ix.rxbs, remoter=ix,
+                                           maxBody=self.maxBody)
 
             if ix.tymeout > 0.0 and ix.tymer.expired:
                 self.closeConnection(ca)
@@ -955,18 +985,22 @@ class Steward():
                  remoter,
                  requestant=None,
                  responder=None,
-                 dictable=False):
+                 dictable=False,
+                 maxBody=None):
         """
         incomer = Incomer instance for connection
         requestant = Requestant instance for connection
         responder = Responder instance for connection
         dictable = True if should attempt to convert request body as json
+        maxBody = maximum allowed request body size in bytes for the requestant.
+            None uses the Requestant.MaxBody default; 0 disables the limit.
         """
         self.remoter = remoter
         if requestant is None:
             requestant = Requestant(msg=self.remoter.rxbs,
                                     remoter=remoter,
-                                    dictable=dictable)
+                                    dictable=dictable,
+                                    maxBody=maxBody)
         self.requestant = requestant
 
         if responder is None:
@@ -1054,6 +1088,7 @@ class BareServer():
                  scheme=u'',
                  dictable=False,
                  timeout=None,
+                 maxBody=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -1073,10 +1108,15 @@ class BareServer():
         eha = external destination address for incoming connections used in TLS
         scheme = http scheme u'http' or u'https' or empty
         dictable = Boolean flag If True attempt to convert body from json for requestants
+        maxBody = maximum allowed request body size in bytes for requestants.
+            None uses the Requestant.MaxBody default; 0 disables the limit
+            (unlimited). Over-limit requests are rejected with status 413
+            before/while buffering to bound memory use.
 
         """
         self.stewards = stewards if stewards is not None else dict()
         self.dictable = True if dictable else False  # for stewards
+        self.maxBody = maxBody  # max request body size for requestants (bytes)
         if timeout is None:
             timeout = self.Timeout
 
@@ -1186,7 +1226,8 @@ class BareServer():
             # check for and handle cutoff connections by client here
 
             if ca not in self.stewards:
-                self.stewards[ca] = Steward(remoter=ix, dictable=self.dictable)
+                self.stewards[ca] = Steward(remoter=ix, dictable=self.dictable,
+                                            maxBody=self.maxBody)
 
             if ix.tymeout > 0.0 and ix.tymer.expired:
                 self.closeConnection(ca)
