@@ -527,7 +527,7 @@ def parseLeader(raw, eols=(CRLF, LF), kind="leader header line", headers=None):
             (yield headers) # leader done
     return
 
-def parseChunk(raw):  # reading transfer encoded raw
+def parseChunk(raw, maxBody=None, accum=0):  # reading transfer encoded raw
     """
     Generator to parse next chunk from raw bytearray.
     Consumes used portions of raw.
@@ -555,6 +555,21 @@ def parseChunk(raw):  # reading transfer encoded raw
         chunk-ext-val   = token | quoted-string
         chunk-data      = chunk-size(OCTET)
         trailer         = *(entity-header CRLF)
+
+    Parameters:
+        raw (bytearray): buffer to parse, consumed as it is used.
+        maxBody (int|None): maximum total body size in bytes allowed across all
+            chunks, or None for no limit. The chunk size is declared on the
+            chunk-size line, so an oversized chunk is rejected there, before its
+            data is waited for and buffered. Checking after the chunk had been
+            assembled would let a single chunk declaring an arbitrary size be
+            buffered in full before it could be refused.
+        accum (int): body bytes already accumulated from previous chunks, added
+            to this chunk's size when testing against maxBody.
+
+    Raises:
+        RequestEntityTooLarge: if accum plus the declared chunk size exceeds
+            maxBody.
     """
     size = 0
     parms = dict()
@@ -574,6 +589,12 @@ def parseChunk(raw):  # reading transfer encoded raw
         size = int(size.strip().decode('ascii'), 16)
     except ValueError:  # bad size
         raise
+
+    # bound memory here, on the declared size, rather than after the chunk has
+    # been assembled: the wait below blocks until the whole chunk is in raw, so
+    # a later check would already have buffered it.
+    if maxBody is not None and accum + size > maxBody:
+        raise RequestEntityTooLarge(maxBody=maxBody, size=accum + size)
 
     if exts:  # parse extensions parameters
         exts = exts.split(b';')

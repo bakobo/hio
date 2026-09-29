@@ -219,7 +219,13 @@ class Requestant(httping.Parsent):
                     raise httping.PrematureClosure("Connection closed unexpectedly"
                                                    " while parsing request body chunk")
 
-                chunkParser = httping.parseChunk(raw=self.msg)
+                # the cap is enforced inside parseChunk, on the declared chunk
+                # size, so an oversized chunk is refused before its data is
+                # buffered. maxBody of 0 means unlimited, spelled None here.
+                chunkParser = httping.parseChunk(
+                    raw=self.msg,
+                    maxBody=self.maxBody if self.maxBody else None,
+                    accum=len(self.body))
                 while True:  # parse another chunk
                     result = next(chunkParser)
                     if result is not None:
@@ -233,11 +239,6 @@ class Requestant(httping.Parsent):
                     self.parms.update(parms)
 
                 if size:  # size non zero so append chunk but keep iterating
-                    # bound memory: reject before accumulating past the limit,
-                    # since chunked transfer has no declared content-length
-                    if self.maxBody and len(self.body) + size > self.maxBody:
-                        raise httping.RequestEntityTooLarge(maxBody=self.maxBody,
-                                                    size=len(self.body) + size)
                     self.body.extend(chunk)
 
                     if self.closed:  # no more data so finish
