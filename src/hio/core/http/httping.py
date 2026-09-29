@@ -601,7 +601,10 @@ def parseChunk(raw, maxBody=None, accum=0):  # reading transfer encoded raw
         for ext in exts:
             ext = ext.strip()
             name, sep, value = ext.partition(b'=')
-            parms[name.strip()] = value.strip() or None
+            # bytes(), not the bytearray slices: a bytearray is unhashable, so
+            # using one as a key raises TypeError, which is not an
+            # HTTPException and so escapes every handler up to the run loop.
+            parms[bytes(name.strip())] = bytes(value.strip()) or None
 
     if size == 0:  # last chunk so parse trailing headers if any
         leaderParser = parseLeader(raw=raw,
