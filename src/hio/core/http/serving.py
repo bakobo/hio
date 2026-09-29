@@ -40,8 +40,9 @@ class Requestant(httping.Parsent):
                        # A declared content-length above this, or accumulated
                        # body bytes exceeding it, is rejected with status 413
                        # before/while buffering to bound memory use.
-                       # Set the maxBody param to 0 (or None mapped to it) to
-                       # disable the limit and restore unbounded legacy behavior.
+                       # Pass maxBody=0 to disable the limit and restore the
+                       # unbounded legacy behavior. maxBody=None selects this
+                       # default; only 0 means unlimited.
 
     def __init__(self, remoter=None, maxBody=None, **kwa):
         """
@@ -747,6 +748,29 @@ class Server():
         return environ
 
 
+    def refuseRequest(self, ca, requestant):
+        """
+        Answer a request that failed to parse with its own status, then close.
+
+        Called when .errored is set on a requestant, which means parsing raised
+        an HTTPException before any application could run. When that exception
+        carried a status (RequestEntityTooLarge carries 413) the client is told
+        what happened rather than seeing the connection drop, which is
+        indistinguishable from a network fault. An error with no status is
+        closed as before.
+        """
+        if requestant.errorStatus is None:  # nothing to answer with
+            self.closeConnection(ca)
+            return
+
+        ix = self.servant.ixes.get(ca)
+        if ix is not None:
+            ix.tx(httping.packErrorResponse(requestant.errorStatus,
+                                            detail=requestant.error))
+            ix.serviceSends()  # flush before the socket goes away
+        self.closeConnection(ca)
+
+
     def closeConnection(self, ca):
         """
         Close and remove connection given by ca
@@ -795,13 +819,15 @@ class Server():
                     #requestant.error = str(ex)
                     #requestant.ended = True
                     sys.stderr.write(str(ex))
-                    self.closeConnection(ca)
+                    requestant.errorStatus = getattr(ex, "status", None)
+                    requestant.error = str(ex)
+                    self.refuseRequest(ca, requestant)
                     continue  # give up on request since shouldn't be here
 
                 if requestant.ended:
                     if requestant.errored:  # parse may swallow error but set .errored and .error
                         sys.stderr.write(requestant.error)
-                        self.closeConnection(ca)
+                        self.refuseRequest(ca, requestant)
                         continue
 
                     logger.info("Parsed Request: %s %s %s", requestant.method,
@@ -1208,6 +1234,26 @@ class BareServer():
         self.servant.close()
 
 
+    def refuseRequest(self, ca, requestant):
+        """
+        Answer a request that failed to parse with its own status, then close.
+
+        Same contract as Server.refuseRequest: an error raised during parsing,
+        before the request was usable, is answered with the status it carried
+        rather than being reported as a success.
+        """
+        if requestant.errorStatus is None:  # nothing to answer with
+            self.closeConnection(ca)
+            return
+
+        ix = self.servant.ixes.get(ca)
+        if ix is not None:
+            ix.tx(httping.packErrorResponse(requestant.errorStatus,
+                                            detail=requestant.error))
+            ix.serviceSends()  # flush before the socket goes away
+        self.closeConnection(ca)
+
+
     def closeConnection(self, ca):
         """
         Close and remove connection and associated steward given by ca
@@ -1238,9 +1284,17 @@ class BareServer():
         """
         Service pending requestants and responders
         """
-        for ca, steward in self.stewards.items():
+        for ca, steward in list(self.stewards.items()):  # may close during loop
             if not steward.waited:
                 steward.requestant.parse()
+
+                if steward.requestant.errored:
+                    # do not respond as though the request succeeded: parsing
+                    # raised before the request was usable, so answer with its
+                    # status (413 for an over-cap body) and close.
+                    sys.stderr.write(steward.requestant.error)
+                    self.refuseRequest(ca, steward.requestant)
+                    continue
 
                 if steward.requestant.ended:
                     steward.requestant.dictify()

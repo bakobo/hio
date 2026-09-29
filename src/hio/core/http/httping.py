@@ -440,6 +440,33 @@ def packHeader(name, *values):
     value = b', '.join(values)
     return (name + b': ' + value)
 
+def packErrorResponse(status, detail=None, version=u'HTTP/1.1'):
+    """
+    Format and return a complete minimal error response as bytes.
+
+    For an error detected while parsing a request, before any application has
+    run: there is no application response to send, but dropping the connection
+    silently leaves the client unable to tell a refusal from a network fault.
+    The response always carries Connection: close, because a request refused
+    without its body being read leaves unread bytes that would otherwise be
+    parsed as the start of the next request on a persistent connection.
+
+    Parameters:
+        status (int): HTTP status code, must be in STATUS_DESCRIPTIONS.
+        detail (str|None): human-readable body text, defaults to the status
+            description.
+        version (str): HTTP version string for the status line.
+    """
+    reason = STATUS_DESCRIPTIONS.get(status, u'Unknown')
+    body = (detail if detail is not None else reason).encode('utf-8')
+    lines = [u"{0} {1} {2}".format(version, status, reason).encode('ascii'),
+             packHeader('Content-Type', 'text/plain; charset=utf-8'),
+             packHeader('Content-Length', len(body)),
+             packHeader('Connection', 'close'),
+             b'',
+             body]
+    return CRLF.join(lines)
+
 def packChunk(msg):
     """
     Return msg bytes in a chunk
@@ -564,6 +591,14 @@ def parseChunk(raw, maxBody=None, accum=0):  # reading transfer encoded raw
             data is waited for and buffered. Checking after the chunk had been
             assembled would let a single chunk declaring an arbitrary size be
             buffered in full before it could be refused.
+
+            The limit is passed in rather than read from a caller, and defaults
+            to None, so a consumer that wants no limit gets the previous
+            behavior unchanged; the client-side Respondent passes nothing. The
+            alternative considered was to yield the parsed size here and let the
+            caller decide, but that adds a third kind of yield to this
+            generator's protocol, which every existing consumer would have to
+            learn.
         accum (int): body bytes already accumulated from previous chunks, added
             to this chunk's size when testing against maxBody.
 
@@ -952,6 +987,7 @@ class Parsent(object):
         self.closed = None  # True when connection closed
         self.errored = False  # True when error occurs in response processing
         self.error = None  # Error Description String
+        self.errorStatus = None  # HTTP status of the error if it carried one
 
         self.headers = None
         self.parms = None  # chunked encoding extension parameters
@@ -1032,6 +1068,7 @@ class Parsent(object):
         self.closed = False
         self.errored = False
         self.error = None
+        self.errorStatus = None
 
         while not self.started:
             if self.msg:
@@ -1058,6 +1095,9 @@ class Parsent(object):
         except HTTPException as ex:
             self.errored = True
             self.error = str(ex)
+            # keep the status so a server can answer with it rather than just
+            # dropping the connection; None when the error carried no status
+            self.errorStatus = getattr(ex, "status", None)
 
         self.ended = True
         self.started = False
