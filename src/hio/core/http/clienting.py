@@ -290,6 +290,9 @@ class Respondent(httping.Parsent):
     Nonblocking HTTP Client Respondent class
     """
     Retry = 100  # sse retry timeout in milliseconds if evented
+    MaxBody = 16777216  # 16 MiB default maximum response body size in bytes.
+                        # Pass maxBody=0 to disable the limit. maxBody=None
+                        # selects this default.
 
     def __init__(self,
                  redirects=None,
@@ -297,6 +300,7 @@ class Respondent(httping.Parsent):
                  events=None,
                  retry=None,
                  leid=None,
+                 maxBody=None,
                  **kwa):
         """
         Initialize Instance:
@@ -306,8 +310,16 @@ class Respondent(httping.Parsent):
         events = deque of events if any
         retry = sse retry timeout in seconds if any if evented
         leid = last event id if any if evented
+        maxBody = maximum allowed response body size in bytes. A response whose
+            declared content-length, declared chunk size or accumulated body
+            exceeds this ends errored with httping.ResponseEntityTooLarge
+            instead of being buffered. None uses the .MaxBody default; 0
+            disables the limit. For an event stream the limit applies to the
+            unparsed remainder, since parsed events are removed from .body.
         """
         super(Respondent, self).__init__(**kwa)
+        self.maxBody = self.MaxBody if maxBody is None else maxBody
+        self.overflowed = False  # True when the body exceeded .maxBody
 
         self.status = None  # Status-Code from status line (consider making this code reason)
         self.code = None  # Status-Code from status line
@@ -521,6 +533,14 @@ class Respondent(httping.Parsent):
         return
 
 
+    def overflow(self, size=None):
+        """
+        Mark the body as over .maxBody and raise ResponseEntityTooLarge
+        """
+        self.overflowed = True
+        raise httping.ResponseEntityTooLarge(maxBody=self.maxBody, size=size)
+
+
     def parseBody(self):
         """
         Parse body
@@ -532,16 +552,25 @@ class Respondent(httping.Parsent):
             raise ValueError("Invalid content length of {0}".format(self.length))
 
         del self.body[:]  # self.body.clear() clear body python2 bytearrays don't clear
+        self.overflowed = False
 
         if self.chunked:  # content-length is ignored if chunked
             self.parms = dict()
             while True:  # parse all chunks here
-                chunkParser = httping.parseChunk(raw=self.msg)
+                # parseChunk checks the declared chunk size, so an oversized
+                # chunk is refused before its data is waited for
+                chunkParser = httping.parseChunk(
+                    raw=self.msg,
+                    maxBody=self.maxBody if self.maxBody else None,
+                    accum=len(self.body))
                 while True:  # parse another chunk
                     if self.closed and not self.msg:  # connection closed prematurely
                         raise httping.PrematureClosure("Connection closed "
                                 "unexpectedly while parsing response body chunk")
-                    result = next(chunkParser)
+                    try:
+                        result = next(chunkParser)
+                    except httping.RequestEntityTooLarge as ex:
+                        self.overflow(size=ex.size)
                     if result is not None:
                         chunkParser.close()
                         break
@@ -562,6 +591,8 @@ class Respondent(httping.Parsent):
                         if (self.eventSource.leid is not None and
                                 self.leid != self.eventSource.leid):
                             self.leid = self.eventSource.leid
+                    if self.maxBody and len(self.body) > self.maxBody:
+                        self.overflow(size=len(self.body))
 
                     if self.closed and not self.msg:  # no more data so finish
                         chunkParser.close()
@@ -574,6 +605,9 @@ class Respondent(httping.Parsent):
                     break
 
         elif self.length != None:  # known content length
+            # refuse an over-limit declared content-length before waiting for it
+            if self.maxBody and self.length > self.maxBody:
+                self.overflow(size=self.length)
             while len(self.msg) < self.length:
                 if self.closed and not self.msg:  # connection closed prematurely
                     raise httping.PrematureClosure("Connection closed unexpectedly"
@@ -597,6 +631,9 @@ class Respondent(httping.Parsent):
                     if (self.eventSource.leid is not None and
                             self.leid != self.eventSource.leid):
                         self.leid = self.eventSource.leid
+
+                if self.maxBody and len(self.body) > self.maxBody:
+                    self.overflow(size=len(self.body))
 
                 if self.closed and not self.msg:  # no more data so finish
                     break
@@ -675,6 +712,7 @@ class Client():
                  redirects=None,
                  responses=None,
                  portOptional=False,
+                 maxBody=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -717,6 +755,9 @@ class Client():
                  each response is dict
             portOptional = True indicates to leave off port 80 for http or
                  443 for https in Host header to support non-compliant server implementations.
+            maxBody = maximum allowed response body size in bytes for the
+                 respondent. None uses the Respondent.MaxBody default; 0
+                 disables the limit.
 
             **kwa are passed through to init .connector tcp.Client or tcp.ClientTLS
         """
@@ -837,7 +878,8 @@ class Client():
                                     dictable=dictable,
                                     events=self.events,
                                     redirectable=redirectable,
-                                    redirects=self.redirects)
+                                    redirects=self.redirects,
+                                    maxBody=maxBody)
         else:
             # do we need to assign the events, redirects also?
             respondent.reinit(msg=self.connector.rxbs,
@@ -1086,6 +1128,11 @@ class Client():
                 self.respondent.ended = True
 
             if self.respondent.ended:
+                if self.respondent.overflowed:
+                    # the rest of the oversized body is still arriving, and
+                    # would be parsed as the start of the next response
+                    self.connector.rxbs.clear()
+                    self.connector.close()
                 self.respondent.dictify()
 
                 if not self.respondent.evented:

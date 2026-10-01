@@ -222,6 +222,24 @@ class RequestEntityTooLarge(HTTPException):
         self.size = size
 
 
+class ResponseEntityTooLarge(HTTPException):
+    """
+    Raised by a client when a response body exceeds the configured maximum
+    size, either by a declared content-length, a declared chunk size, or bytes
+    accumulated while parsing.
+    """
+    def __init__(self, maxBody, size=None):
+        if size is None:
+            detail = ("Response body exceeds maximum allowed size of {0} bytes"
+                      .format(maxBody))
+        else:
+            detail = ("Response body size {0} exceeds maximum allowed size of "
+                      "{1} bytes".format(size, maxBody))
+        HTTPException.__init__(self, detail)
+        self.maxBody = maxBody
+        self.size = size
+
+
 class HTTPError(Exception):
     """
     HTTP error for use with Valet or Other WSGI servers to raise exceptions
