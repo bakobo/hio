@@ -222,7 +222,10 @@ class Server(Acceptor):
         ixes (dict): incoming connections indexed by remote (host, port) duple
     """
 
-    Tymeout = 1.0  # tymeout in seconds virtual tyme
+    # 0.0 means accepted connections never time out. This was 1.0, but the
+    # value never reached Remoter (it was passed as timeout=), so 0.0 is the
+    # behavior every caller has actually had; pass tymeout to opt in.
+    Tymeout = 0.0  # tymeout in seconds virtual tyme
 
     def __init__(self,
                  ha=None,
@@ -278,7 +281,7 @@ class Server(Acceptor):
                               cs=cs,
                               bs=self.bs,
                               wl=self.wl,
-                              timeout=self.tymeout)
+                              tymeout=self.tymeout)
             if ca in self.ixes and self.ixes[ca] is not remoter:
                 self.shutdownIx(ca)
             self.ixes[ca] = remoter
@@ -556,7 +559,7 @@ class ServerTls(Server):
                                  bs=self.bs,
                                  cs=cs,
                                  wl=self.wl,
-                                 timeout=self.tymeout,
+                                 tymeout=self.tymeout,
                                  context=self.context,
                                  version=self.version,
                                  certify=self.certify,
