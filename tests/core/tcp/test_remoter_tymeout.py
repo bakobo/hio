@@ -14,7 +14,7 @@ must measure idle tyme from the latest byte, must not cut a response in
 progress, must not crash a server serviced without a Tymist, and must also
 reach TLS connections that never finish their handshake.
 
-Ports 6431-6448 are used only here.
+Ports 6431-6458 are used only here.
 """
 import os
 import socket
@@ -178,7 +178,7 @@ def test_bare_server_keeps_idle_persistent_connection_by_default():
     sock = socket.create_connection(("127.0.0.1", port))
     try:
         sock.sendall(b"GET /echo HTTP/1.1\r\nHost: loc\r\nContent-Length: 0\r\n\r\n")
-        data = _recvAll(sock, server, until=b'"method": "GET"')
+        data = _recvAll(sock, server, until=b'"method":"GET"')
         assert data.startswith(b"HTTP/1.1 200 OK")
 
         _advance(server, tymist, 40)  # 10 s idle between requests
@@ -283,7 +283,8 @@ def test_http_server_drops_partial_second_request_after_tymeout():
         assert server.servant.ixes
 
         sock.sendall(b"GET / HTTP/1.1\r\nHo")  # head never finishes
-        assert _serviceUntil(server, lambda: not server.keeps)  # request begun
+        ix = next(iter(server.servant.ixes.values()))
+        assert _serviceUntil(server, lambda: server.reqs[ix.ca].started)  # request begun
         _advance(server, tymist, 3)  # 0.75 s
         assert server.servant.ixes
         _advance(server, tymist, 2)  # 1.25 s
@@ -321,15 +322,22 @@ def test_http_server_serves_request_buffered_at_tymeout_boundary():
         server.close()
 
 
-def test_http_server_keeps_finished_response_with_unsent_bytes():
+BIG = 20000  # response body size
+
+
+def _bigApp(environ, start_response):
+    start_response("200 OK", [("Content-Length", str(BIG))])
+    return [b"x" * BIG]
+
+
+def test_http_server_drops_stopped_reader():
     """
-    A response that has ended but whose bytes a slow reader has not taken
-    yet is not cut, however long the reader stalls.
+    A finished response whose bytes the reader has stopped taking is dropped
+    after tymeout without send progress, rather than held forever.
     """
     tymist = tyming.Tymist(tock=0.25)
     port = 6445
-    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(),
-                         tymeout=1.0, keepTymeout=1.0)
+    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(), tymeout=1.0)
     server.servant.reopen()
     sock = socket.create_connection(("127.0.0.1", port))
     try:
@@ -342,13 +350,46 @@ def test_http_server_keeps_finished_response_with_unsent_bytes():
                              next(iter(server.reps.values())).ended)
         assert ix.txbs  # response finished but unsent
 
-        _advance(server, tymist, 16)  # 4 s stalled
+        _advance(server, tymist, 3)  # 0.75 s without progress
         assert server.servant.ixes
-        assert ix.txbs
+        _advance(server, tymist, 2)  # 1.25 s without progress
+        assert not server.servant.ixes
+    finally:
+        sock.close()
+        server.close()
 
-        del ix.send  # reader resumes
-        data = _recvAll(sock, server, until=b"\r\n\r\nok")
-        assert data.endswith(b"\r\n\r\nok")
+
+def test_http_server_keeps_slow_reader():
+    """
+    A reader taking a large response a little at a time, more often than
+    tymeout, is not cut however long the whole body takes.
+    """
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6451
+    server = http.Server(port=port, app=_bigApp, tymth=tymist.tymen(), tymeout=1.0)
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        assert _serviceUntil(server, lambda: server.servant.ixes)
+        ix = next(iter(server.servant.ixes.values()))
+        send = ix.send
+        ix.send = lambda data: send(data[:1000])  # 1000 bytes per cycle
+
+        sock.sendall(REQUEST)
+        sock.setblocking(False)
+        data = b""
+        for _ in range(60):  # 15 virtual s, far past tymeout
+            tymist.tick()
+            server.service()
+            time.sleep(0.005)
+            try:
+                data += sock.recv(65536)
+            except BlockingIOError:
+                pass
+            assert server.servant.ixes
+            if data.endswith(b"x" * 1000) and len(data) > BIG:
+                break
+        assert data.endswith(b"\r\n\r\n" + b"x" * BIG)
     finally:
         sock.close()
         server.close()
@@ -485,5 +526,185 @@ def test_tls_server_expires_handshake_accepted_before_wind():
                 tymist.tick()
                 server.serviceConnects()
             assert not server.cxes
+        finally:
+            sock.close()
+
+
+def test_http_server_keeps_fresh_connection_before_first_byte():
+    """
+    tymeout starts at a request's first byte. A client that connects and
+    sends its first request much later, as keripy's HTTPMessenger may, is
+    governed by keepTymeout (default never), not dropped after tymeout.
+    """
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6449
+    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(), tymeout=1.0)
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        assert _serviceUntil(server, lambda: server.servant.ixes)
+        _advance(server, tymist, 24)  # 6 s before the first byte
+        assert server.servant.ixes
+
+        sock.sendall(REQUEST)
+        data = _recvAll(sock, server, until=b"\r\n\r\nok")
+        assert data.endswith(b"\r\n\r\nok")
+    finally:
+        sock.close()
+        server.close()
+
+
+def test_http_server_drops_fresh_connection_after_keep_tymeout():
+    """A fresh connection with no bytes is dropped after keepTymeout when set."""
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6457
+    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(),
+                         tymeout=1.0, keepTymeout=2.0)
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        assert _serviceUntil(server, lambda: server.servant.ixes)
+        _advance(server, tymist, 7)  # 1.75 s
+        assert server.servant.ixes
+        _advance(server, tymist, 2)  # 2.25 s
+        assert not server.servant.ixes
+    finally:
+        sock.close()
+        server.close()
+
+
+def test_http_server_prunes_removed_and_replaced_connections():
+    """
+    A connection the servant removes or replaces at the same ca leaves no
+    requestant or responder reading the old remoter.
+    """
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6450
+    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(), tymeout=1.0)
+    server.servant.reopen()
+    sockA = socket.create_connection(("127.0.0.1", port))
+    sockB = socket.create_connection(("127.0.0.1", port))
+    try:
+        sockA.sendall(REQUEST)
+        data = _recvAll(sockA, server, until=b"\r\n\r\nok")
+        assert data.endswith(b"\r\n\r\nok")
+        assert len(server.servant.ixes) == 2
+        caA = sockA.getsockname()
+        caB = sockB.getsockname()
+        caA = next(ca for ca in server.servant.ixes if ca[1] == caA[1])
+        caB = next(ca for ca in server.servant.ixes if ca[1] == caB[1])
+        assert caA in server.reqs and caA in server.reps
+
+        # replace: the remoter for B now sits under A's ca
+        ixB = server.servant.ixes.pop(caB)
+        server.servant.ixes[caA].close()
+        server.servant.ixes[caA] = ixB
+        sockB.sendall(REQUEST)
+        data = _recvAll(sockB, server, until=b"\r\n\r\nok")
+        assert data.endswith(b"\r\n\r\nok")  # served from the new remoter
+        assert server.reqs[caA].remoter is ixB
+        assert caB not in server.reqs
+
+        # remove, as serviceReceivesAllIx does on an OSError
+        server.servant.removeIx(caA)
+        server.service()
+        assert not server.reqs and not server.reps
+    finally:
+        sockA.close()
+        sockB.close()
+        server.close()
+
+
+def test_bare_server_sends_http10_response_before_closing():
+    """
+    A non-persistent (HTTP/1.0) connection is closed only after its response
+    has been sent.
+    """
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6453
+    server = http.BareServer(port=port, tymth=tymist.tymen(), timeout=1.0)
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        sock.sendall(b"GET /echo HTTP/1.0\r\nHost: loc\r\n\r\n")
+        sock.setblocking(False)
+        data = b""
+        closed = False
+        for _ in range(100):
+            server.service()
+            try:
+                chunk = sock.recv(65536)
+            except BlockingIOError:
+                chunk = None
+            if chunk == b"":
+                closed = True
+                break
+            if chunk:
+                data += chunk
+            time.sleep(0.01)
+        assert data.startswith(b"HTTP/1.1 200 OK")
+        assert b'"method":"GET"' in data
+        assert closed
+        assert not server.servant.ixes
+    finally:
+        sock.close()
+        server.servant.close()
+
+
+def test_bare_server_wound_by_server_doer():
+    """BareServer can be wound, as by http.ServerDoer, so its timeouts fire."""
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6454
+    server = http.BareServer(port=port, timeout=1.0)  # no tymth
+    doer = http.ServerDoer(server=server)
+    doer.wind(tymist.tymen())
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: loc")  # headers never finish
+        assert _serviceUntil(server, lambda: server.servant.ixes)
+        _advance(server, tymist, 5)  # 1.25 s
+        assert not server.servant.ixes
+    finally:
+        sock.close()
+        server.servant.close()
+
+
+def test_http_server_applies_explicit_tymeout_to_held_connections():
+    """
+    An explicit tymeout given with a servant also reaches the connections
+    the servant already holds, in .ixes and, for TLS, in .cxes.
+    """
+    tymist = tyming.Tymist(tock=0.25)
+    with tcp.openServer(tymth=tymist.tymen(), ha=("", 6455)) as servant:
+        sock, ix = _accept(servant, 6455)
+        try:
+            assert ix.tymeout == 0.0
+            http.Server(port=6455, app=_okApp, servant=servant, tymeout=1.5)
+            assert ix.tymeout == 1.5
+            assert ix.tymer.duration == 1.5
+        finally:
+            sock.close()
+
+    certDirPath = localTestCertDirPath()
+    with tcp.openServer(cls=tcp.ServerTls,
+                        tymth=tymist.tymen(),
+                        ha=("", 6456),
+                        keypath=os.path.join(certDirPath, 'server_key.pem'),
+                        certpath=os.path.join(certDirPath, 'server_cert.pem'),
+                        cafilepath=os.path.join(certDirPath, 'client.pem')) as servant:
+        sock = socket.create_connection(("127.0.0.1", 6456))
+        try:
+            for _ in range(50):
+                servant.serviceConnects()
+                if servant.cxes:
+                    break
+                time.sleep(0.02)
+            cx = next(iter(servant.cxes.values()))
+            assert cx.tymeout == 0.0
+            http.Server(port=6456, app=_okApp, servant=servant, tymeout=1.0)
+            assert cx.tymeout == 1.0
+            _advance(servant, tymist, 5)
+            assert not servant.cxes  # handshake deadline now applies
         finally:
             sock.close()
