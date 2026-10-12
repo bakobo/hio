@@ -217,7 +217,10 @@ class Server(Acceptor):
         opened (bool): True if listen socket ss is open; False otherwise
 
     Attributes:
-        tymeout (float): timeout in seconds for connection refresh
+        tymeout (float): idle tymeout in seconds passed to each accepted
+            Remoter. A connection with no bytes received or sent for tymeout
+            has an expired .tymer; the owner of the server decides whether to
+            drop it. 0.0 means never time out.
         wl (WireLog | None): WireLog instance if any
         ixes (dict): incoming connections indexed by remote (host, port) duple
     """
@@ -496,7 +499,9 @@ class ServerTls(Server):
         ss (socket.socket | None): server listen socket for incoming accept requests
         axes (deque): accepted connection duples (ca, cs)
         opened (bool): True if listen socket ss is open; False otherwise
-        timeout (float): timeout in seconds for connection refresh
+        tymeout (float): idle tymeout in seconds passed to each accepted
+            RemoterTls. A connection that has not completed its TLS handshake
+            within tymeout is dropped. 0.0 means never time out.
         wl (WireLog | None): WireLog instance if any
         ixes (dict): incoming connections indexed by remote (host, port) duple
 
@@ -575,15 +580,23 @@ class ServerTls(Server):
         """
         Service handshakes for every remoter in .cxes
         If successful move to .ixes
+        Drop any whose handshake has not completed within its tymeout
         """
         for ca, cx in list(self.cxes.items()):  # list so can remove during iteration
             cx.handshake()
             if cx.connected:  # handshake completed successfully
                 del self.cxes[ca]
+                cx.refresh()  # idle tyme on ixes counts from handshake completion
                 self.ixes[ca] = cx  # add to incoming connections
                 continue
             if cx.aborted:  # handshake completed unsuccessfully
                 del self.cxes[ca] # remove and let client startover
+                continue
+            if cx.expired:  # handshake never completed so drop
+                logger.info("Dropping incoming connection from %s: tls "
+                            "handshake not completed within %s s.", ca, cx.tymeout)
+                cx.close()
+                del self.cxes[ca]
                 continue
 
 
@@ -691,11 +704,25 @@ class Remoter(tyming.Tymee):
             self.cs = None
 
 
+    @property
+    def expired(self):
+        """
+        Returns True if this connection has been idle for longer than .tymeout.
+        Never True when .tymeout is 0.0 or when no tymth has been wound, since
+        without a tyme there is no idle tyme to measure.
+        """
+        return (self.tymeout > 0.0 and self.tymer.tyme is not None
+                and self.tymer.expired)
+
+
     def refresh(self):
         """
-        Restart tymer
+        Restart tymer from now, so .tymeout measures idle tyme since the
+        latest activity. Not a lossless restart: that would add a whole
+        tymeout per refresh and a trickling peer would never expire.
         """
-        self.tymer.restart()
+        if self.tymer.tyme is not None:  # no tymth wound means nothing to time
+            self.tymer.start()
 
 
     def receive(self):
@@ -968,6 +995,9 @@ class RemoterTls(Remoter):
             if self.wl:  # log over the wire rx
                 self.wl.writeRx(data, who=self.cs.getpeername())
 
+            if self.refreshable:
+                self.refresh()
+
         else:  # data empty so connection closed on other end
             self.cutoff = True
 
@@ -1005,6 +1035,9 @@ class RemoterTls(Remoter):
         if result:
             if self.wl:
                 self.wl.writeTx(data[:result], who=self.cs.getpeername())
+
+            if self.refreshable:
+                self.refresh()
 
         return result
 

@@ -79,9 +79,6 @@ class Requestant(httping.Parsent):
             if connection and "keep-alive" in connection.lower():
                 self.persisted = True
 
-        if self.persisted:  # override timeout so server never timesout
-            self.remoter.tymeout =  0.0  # never timesout
-
 
     def parseHead(self):
         """
@@ -550,7 +547,11 @@ class Server():
             scheme is http scheme u'http' or u'https' or empty
                 for servant and WSGI environment
             kwa needed to pass additional parameters to servant
-            tymeout is tymeout in seconds for dropping idle connections
+            tymeout is tymeout in seconds for dropping idle connections. A
+                connection is dropped once no bytes have been received or
+                sent on it for tymeout and no response is in progress on it.
+                0.0 means never drop. Only applies to a servant created here;
+                a servant passed in keeps its own tymeout.
 
         Attributes:
             .app is wsgi application callable
@@ -747,7 +748,13 @@ class Server():
             if ca not in self.reqs:  # point requestant.msg to incomer.rxbs
                 self.reqs[ca] = Requestant(msg=ix.rxbs, remoter=ix)
 
-            if ix.tymeout > 0.0 and ix.tymer.expired:
+            # a response in progress, such as a long poll yielding b'' while
+            # it waits, sends nothing, so idle tyme alone must not cut it
+            responder = self.reps.get(ca)
+            if responder is not None and not responder.ended:
+                continue
+
+            if ix.expired:
                 self.closeConnection(ca)
 
 
@@ -803,6 +810,8 @@ class Server():
 
             if not responder.ended:
                 responder.service()
+                if responder.ended:  # idle tyme counts from end of response
+                    responder.incomer.refresh()
 
             if responder.ended:
                 requestant = self.reqs[ca]
@@ -978,9 +987,9 @@ class Steward():
 
     def refresh(self):
         """
-        Restart incomer tymer
+        Restart incomer tymer from now
         """
-        self.remoter.tymer.restart()
+        self.remoter.refresh()
 
 
     def respond(self):
@@ -1073,6 +1082,9 @@ class BareServer():
         eha = external destination address for incoming connections used in TLS
         scheme = http scheme u'http' or u'https' or empty
         dictable = Boolean flag If True attempt to convert body from json for requestants
+        timeout = idle tymeout in seconds for a servant created here. A connection
+            is dropped once no bytes have been received or sent on it for
+            timeout and no response is in progress on it. 0.0 means never drop.
 
         """
         self.stewards = stewards if stewards is not None else dict()
@@ -1182,13 +1194,16 @@ class BareServer():
         Timeout stale connections
         """
         self.servant.serviceConnects()
-        for ca, ix in self.servant.ixes.items():
+        for ca, ix in list(self.servant.ixes.items()):  # ixes changes during iteration
             # check for and handle cutoff connections by client here
 
             if ca not in self.stewards:
                 self.stewards[ca] = Steward(remoter=ix, dictable=self.dictable)
 
-            if ix.tymeout > 0.0 and ix.tymer.expired:
+            if self.stewards[ca].waited:  # response in progress so not idle
+                continue
+
+            if ix.expired:
                 self.closeConnection(ca)
 
 
@@ -1196,7 +1211,7 @@ class BareServer():
         """
         Service pending requestants and responders
         """
-        for ca, steward in self.stewards.items():
+        for ca, steward in list(self.stewards.items()):  # closeConnection deletes
             if not steward.waited:
                 steward.requestant.parse()
 
