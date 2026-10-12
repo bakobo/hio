@@ -544,6 +544,16 @@ class ServerTls(Server):
                                         )
 
 
+    def wind(self, tymth):
+        """
+        Inject new tymist.tymth as new ._tymth. Changes tymist.tyme base.
+        Also winds connections still in handshake in .cxes so they can expire.
+        """
+        super(ServerTls, self).wind(tymth)
+        for cx in self.cxes.values():  # remoterTls
+            cx.wind(tymth)
+
+
     def serviceAxes(self):
         """
         Service accepteds
@@ -593,7 +603,7 @@ class ServerTls(Server):
                 del self.cxes[ca] # remove and let client startover
                 continue
             if cx.expired:  # handshake never completed so drop
-                logger.info("Dropping incoming connection from %s: tls "
+                logger.debug("Dropping incoming connection from %s: tls "
                             "handshake not completed within %s s.", ca, cx.tymeout)
                 cx.close()
                 del self.cxes[ca]

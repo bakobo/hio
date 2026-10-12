@@ -508,8 +508,17 @@ def openServer(cls=None, **kwa):
 class Server():
     """
     Server WSGI HTTP Server Class
+
+    Connection expiry: a connection is never dropped while a response is in
+    progress on it or while response bytes remain unsent. Otherwise, a
+    connection that is receiving a request (none completed yet, or the next
+    request on a persistent connection has begun to arrive) is dropped after
+    tymeout seconds without receiving or sending a byte, and a persistent
+    connection that is idle between requests is dropped after keepTymeout
+    seconds without a byte, or never if keepTymeout is 0.0.
     """
     Tymeout = 5.0  # default tcp server connection tymeout
+    KeepTymeout = 0.0  # default keep alive tymeout, 0.0 means never
 
     def __init__(self,
                  name="hio.wsgi.server",
@@ -525,6 +534,7 @@ class Server():
                  eha=None,
                  scheme=u'',
                  tymeout=None,
+                 keepTymeout=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -547,18 +557,31 @@ class Server():
             scheme is http scheme u'http' or u'https' or empty
                 for servant and WSGI environment
             kwa needed to pass additional parameters to servant
-            tymeout is tymeout in seconds for dropping idle connections. A
-                connection is dropped once no bytes have been received or
-                sent on it for tymeout and no response is in progress on it.
-                0.0 means never drop. Only applies to a servant created here;
-                a servant passed in keeps its own tymeout.
+            tymeout is tymeout in seconds for dropping a connection that
+                has gone silent while a request is being received on it
+                (slow or abandoned request head or body), and for dropping a
+                TLS connection whose handshake has not completed. It does not
+                apply to a persistent connection idle between requests; see
+                keepTymeout. 0.0 means never drop. None means Server.Tymeout
+                for a servant created here, and leaves a passed in servant's
+                own tymeout unchanged; an explicit value is applied to a passed
+                in servant too.
+            keepTymeout is tymeout in seconds for dropping a persistent
+                (keep alive) connection that is idle between requests: a
+                request completed on it, its response has been sent, and no
+                byte of a next request has arrived. None means
+                Server.KeepTymeout. 0.0 means never drop, which suits clients
+                that hold one connection open across long gaps and do not
+                reconnect when the server closes it.
 
         Attributes:
             .app is wsgi application callable
             .reqs is dict of Requestant instances keyed by ca
             .reps is dict of running Wsgi Responder instances keyed by ca
             .servant is instance of Server or ServerTls or None
-            .tymeout is tymeout in seconds for dropping idle connections
+            .keepTymeout is tymeout in seconds for dropping persistent
+                connections idle between requests, 0.0 means never
+            .keeps is set of ca of persistent connections idle between requests
             .scheme is http scheme http or https for servant and environment
             .secured is Boolean true if TLS
 
@@ -569,9 +592,9 @@ class Server():
         self.reqs.clear()  # items should only be assigned by valet
         self.reps = reps if reps is not None else dict()  # allows external view
         self.reps.clear()  # items should only be assigned by valet
-
-        if tymeout is None:
-            tymeout = self.Tymeout
+        self.keepTymeout = (keepTymeout if keepTymeout is not None
+                            else self.KeepTymeout)
+        self.keeps = set()  # ca of persistent connections idle between requests
 
         ha = ha or (host, port)  # ha = host address takes precendence over host, port
         if servant:
@@ -607,8 +630,12 @@ class Server():
             if servant.ha != ha:
                 ValueError("Provided ha '{0}:{1}' incompatible with servant".format(ha[0], ha[1]))
             # at some point may want to support changing the ha of provided servant
+            if tymeout is not None:  # explicit so apply to provided servant
+                servant.tymeout = tymeout
 
         else:  # what about timeouts for servant connections
+            if tymeout is None:
+                tymeout = self.Tymeout
             if secured:
                 servant = tcp.ServerTls(ha=ha,
                                     eha=eha,
@@ -722,6 +749,7 @@ class Server():
         """
         Close and remove connection given by ca
         """
+        self.keeps.discard(ca)
         if ca in self.reqs:
             self.reqs[ca].close()  # this signals request parser
             del self.reqs[ca]
@@ -748,13 +776,39 @@ class Server():
             if ca not in self.reqs:  # point requestant.msg to incomer.rxbs
                 self.reqs[ca] = Requestant(msg=ix.rxbs, remoter=ix)
 
-            # a response in progress, such as a long poll yielding b'' while
-            # it waits, sends nothing, so idle tyme alone must not cut it
-            responder = self.reps.get(ca)
-            if responder is not None and not responder.ended:
-                continue
 
-            if ix.expired:
+    def expired(self, ca, ix):
+        """
+        Returns True if connection ix at ca should be dropped for inactivity.
+        See class docstring for the rules.
+        """
+        if ix.tymer.tyme is None:  # no tymth wound so nothing to time
+            return False
+
+        # a response in progress, such as a long poll yielding b'' while it
+        # waits, sends nothing, so idle tyme alone must not cut it. Nor may a
+        # finished response whose bytes a slow reader has not yet taken.
+        responder = self.reps.get(ca)
+        if (responder is not None and not responder.ended) or ix.txbs:
+            return False
+
+        if ca in self.keeps:  # persistent connection idle between requests
+            return (self.keepTymeout > 0.0
+                    and ix.tymer.elapsed >= self.keepTymeout)
+
+        return ix.expired  # receiving a request so tymeout applies
+
+
+    def serviceTymeouts(self):
+        """
+        Drop connections that have expired. Run after receives so that bytes
+        already received count as activity.
+        """
+        for ca, ix in list(self.servant.ixes.items()):  # closeConnection removes
+            if ca in self.keeps and ix.rxbs:  # next request has begun
+                self.keeps.discard(ca)
+            if self.expired(ca, ix):
+                logger.debug("Dropping idle incoming connection from %s.", ca)
                 self.closeConnection(ca)
 
 
@@ -812,6 +866,8 @@ class Server():
                 responder.service()
                 if responder.ended:  # idle tyme counts from end of response
                     responder.incomer.refresh()
+                    if self.reqs[ca].persisted:  # idle between requests
+                        self.keeps.add(ca)
 
             if responder.ended:
                 requestant = self.reqs[ca]
@@ -829,6 +885,7 @@ class Server():
         """
         self.serviceConnects()
         self.servant.serviceReceivesAllIx()
+        self.serviceTymeouts()
         self.serviceReqs()
         self.serviceReps()
         self.servant.serviceSendsAllIx()
@@ -1039,16 +1096,20 @@ class Steward():
 
         if self.responder.ended:
             self.waited = False
-        else:
-            self.refresh()
+            self.refresh()  # idle tyme counts from end of response
 
 
 class BareServer():
     """
     BareServer class nonblocking Bare (non-WSGI) HTTP server
     Define CustomResponder subclass to respond to requests as per Steward
+
+    Connection expiry follows the same rules as Server, with timeout in the
+    role of Server's tymeout and a steward waiting on its response as the
+    response in progress.
     """
     Timeout = 5.0  # default tcp server (servant) connection timeout
+    KeepTymeout = 0.0  # default keep alive tymeout, 0.0 means never
 
     def __init__(self,
                  servant=None,
@@ -1063,6 +1124,7 @@ class BareServer():
                  scheme=u'',
                  dictable=False,
                  timeout=None,
+                 keepTymeout=None,
                  **kwa):
         """
         Initialization method for instance.
@@ -1082,15 +1144,23 @@ class BareServer():
         eha = external destination address for incoming connections used in TLS
         scheme = http scheme u'http' or u'https' or empty
         dictable = Boolean flag If True attempt to convert body from json for requestants
-        timeout = idle tymeout in seconds for a servant created here. A connection
-            is dropped once no bytes have been received or sent on it for
-            timeout and no response is in progress on it. 0.0 means never drop.
+        timeout = tymeout in seconds for dropping a connection gone silent while
+            a request is being received on it, or whose TLS handshake has not
+            completed. Not applied to a persistent connection idle between
+            requests; see keepTymeout. 0.0 means never drop. None means
+            BareServer.Timeout for a servant created here and leaves a passed
+            in servant's own tymeout unchanged; an explicit value is applied
+            to a passed in servant too.
+        keepTymeout = tymeout in seconds for dropping a persistent connection
+            idle between requests. None means BareServer.KeepTymeout. 0.0
+            means never drop.
 
         """
         self.stewards = stewards if stewards is not None else dict()
         self.dictable = True if dictable else False  # for stewards
-        if timeout is None:
-            timeout = self.Timeout
+        self.keepTymeout = (keepTymeout if keepTymeout is not None
+                            else self.KeepTymeout)
+        self.keeps = set()  # ca of persistent connections idle between requests
 
         ha = ha or (host, port)  # ha = host address takes precendence over host, port
         if servant:
@@ -1125,8 +1195,12 @@ class BareServer():
             if servant.ha != ha:
                 ValueError("Provided ha '{0}:{1}' incompatible with servant".format(ha[0], ha[1]))
             # at some point may want to support changing the ha of provided servant
+            if timeout is not None:  # explicit so apply to provided servant
+                servant.tymeout = timeout
 
         else:  # what about timeouts for servant connections
+            if timeout is None:
+                timeout = self.Timeout
             if secured:
                 servant = tcp.ServerTls(name=name,
                                     ha=ha,
@@ -1183,6 +1257,7 @@ class BareServer():
         """
         Close and remove connection and associated steward given by ca
         """
+        self.keeps.discard(ca)
         self.servant.removeIx(ca)
         del self.stewards[ca]
 
@@ -1200,10 +1275,36 @@ class BareServer():
             if ca not in self.stewards:
                 self.stewards[ca] = Steward(remoter=ix, dictable=self.dictable)
 
-            if self.stewards[ca].waited:  # response in progress so not idle
-                continue
 
-            if ix.expired:
+    def expired(self, ca, ix):
+        """
+        Returns True if connection ix at ca should be dropped for inactivity.
+        See Server class docstring for the rules.
+        """
+        if ix.tymer.tyme is None:  # no tymth wound so nothing to time
+            return False
+
+        steward = self.stewards.get(ca)
+        if (steward is not None and steward.waited) or ix.txbs:
+            return False  # response in progress or unsent
+
+        if ca in self.keeps:  # persistent connection idle between requests
+            return (self.keepTymeout > 0.0
+                    and ix.tymer.elapsed >= self.keepTymeout)
+
+        return ix.expired  # receiving a request so timeout applies
+
+
+    def serviceTymeouts(self):
+        """
+        Drop connections that have expired. Run after receives so that bytes
+        already received count as activity.
+        """
+        for ca, ix in list(self.servant.ixes.items()):  # closeConnection removes
+            if ca in self.keeps and ix.rxbs:  # next request has begun
+                self.keeps.discard(ca)
+            if self.expired(ca, ix):
+                logger.debug("Dropping idle incoming connection from %s.", ca)
                 self.closeConnection(ca)
 
 
@@ -1232,6 +1333,7 @@ class BareServer():
             if not steward.waited and steward.requestant.ended:
                 if steward.requestant.persisted:
                     steward.requestant.makeParser()  #set up for next time
+                    self.keeps.add(ca)  # idle between requests
                 else:  # remove and close connection
                     self.closeConnection(ca)
 
@@ -1242,6 +1344,7 @@ class BareServer():
         """
         self.serviceConnects()
         self.servant.serviceReceivesAllIx()
+        self.serviceTymeouts()
         self.serviceStewards()
         self.servant.serviceSendsAllIx()
 
