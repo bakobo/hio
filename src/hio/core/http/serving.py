@@ -521,12 +521,15 @@ def connectionExpired(ix, requesting, responding, keepTymeout):
 
     Phases, in order of precedence:
         unsent response bytes in ix.txbs: dropped after ix.tymeout without
-            send progress, so a slow reader that is still taking bytes is
-            kept and a reader that has stopped is dropped.
+            send progress (ix.sendTymer, which received bytes do not
+            restart), so a slow reader that is still taking bytes is kept
+            and a reader that has stopped is dropped even if it keeps
+            sending.
         response in progress (for example a long poll yielding b'' while it
             waits): never dropped, though it sends nothing.
         receiving a request: dropped after ix.tymeout without a byte. The
-            clock starts at the request's first byte.
+            clock starts at the request's first byte; under TLS, at the
+            first decrypted byte, so a partial TLS record does not start it.
         otherwise idle, no byte of a request yet on a fresh connection or
             between requests on a persistent one: dropped after keepTymeout
             without a byte, never if keepTymeout is 0.0.
@@ -536,12 +539,22 @@ def connectionExpired(ix, requesting, responding, keepTymeout):
     if ix.tymer.tyme is None:  # no tymth wound so nothing to time
         return False
     if ix.txbs:  # stalled sender
-        return ix.expired
+        return ix.sendExpired
     if responding:
         return False
     if requesting:
         return ix.expired
     return keepTymeout > 0.0 and ix.tymer.elapsed >= keepTymeout
+
+
+def requestUnderway(ix, requestant):
+    """
+    Returns True if at least one byte of a request not yet completely
+    received has arrived on connection ix, given its Requestant if any:
+    bytes not yet parsed are waiting in ix.rxbs, or requestant has started
+    parsing a request it has not finished.
+    """
+    return bool(ix.rxbs) or bool(requestant is not None and requestant.started)
 
 
 def serviceTymeouts(servant, keepTymeout, requesting, responding, close):
@@ -575,8 +588,16 @@ class Server():
     whether fresh or between requests; a response in progress is never cut.
     For a ServerTls servant, tymeout is also a total deadline for the TLS
     handshake from accept.
+
+    Every timeout is off by default (0.0, never). Timeouts are measured in
+    tyme, and when a Doist cycle runs slow the Doist runs catch up cycles
+    back to back, so tyme can advance seconds in milliseconds of wall time.
+    A timeout on by default would then drop healthy clients, including
+    clients that do not reconnect, in the middle of a request. Pass tymeout
+    and keepTymeout to opt in, with values comfortably larger than the
+    longest catch up a deployment expects.
     """
-    Tymeout = 5.0  # default tcp server connection tymeout
+    Tymeout = 0.0  # default tcp server connection tymeout, 0.0 means never
     KeepTymeout = 0.0  # default keep alive tymeout, 0.0 means never
 
     def __init__(self,
@@ -618,8 +639,9 @@ class Server():
             kwa needed to pass additional parameters to servant
             tymeout is tymeout in seconds for dropping a connection that
                 has gone silent while a request is being received on it,
-                counted from the request's first byte (slow or abandoned
-                request head or body), or that has made no send progress
+                counted from the request's first byte (under TLS, its first
+                decrypted byte) (slow or abandoned request head or body), or
+                that has made no send progress
                 while response bytes are queued. With a ServerTls servant it
                 is also a total deadline from accept for the TLS handshake
                 to complete; handshake traffic does not restart it. It does
@@ -844,7 +866,6 @@ class Server():
         Create requestants
         """
         self.servant.serviceConnects()
-        self.pruneConnections()
         for ca, ix in list(self.servant.ixes.items()):  # ixes changes during iteration
             if ix.cutoff:
                 self.closeConnection(ca)
@@ -859,8 +880,7 @@ class Server():
         Returns True if a byte of a request not yet completely received has
         arrived on connection ix at ca
         """
-        requestant = self.reqs.get(ca)
-        return bool(ix.rxbs) or bool(requestant is not None and requestant.started)
+        return requestUnderway(ix, self.reqs.get(ca))
 
 
     def responding(self, ca, ix):
@@ -1177,8 +1197,16 @@ class BareServer():
     Connection expiry follows the same rules as Server (see connectionExpired),
     with timeout in the role of Server's tymeout and a steward waiting on its
     response as the response in progress.
+
+    Every timeout is off by default (0.0, never). Timeouts are measured in
+    tyme, and when a Doist cycle runs slow the Doist runs catch up cycles
+    back to back, so tyme can advance seconds in milliseconds of wall time.
+    A timeout on by default would then drop healthy clients, including
+    clients that do not reconnect, in the middle of a request. Pass tymeout
+    and keepTymeout to opt in, with values comfortably larger than the
+    longest catch up a deployment expects.
     """
-    Timeout = 5.0  # default tcp server (servant) connection timeout
+    Timeout = 0.0  # default tcp server (servant) connection timeout, 0.0 never
     KeepTymeout = 0.0  # default keep alive tymeout, 0.0 means never
 
     def __init__(self,
@@ -1339,7 +1367,7 @@ class BareServer():
         Close and remove connection and associated steward given by ca
         """
         self.servant.removeIx(ca)
-        del self.stewards[ca]
+        self.stewards.pop(ca, None)
 
 
     def pruneConnections(self):
@@ -1358,9 +1386,10 @@ class BareServer():
         Create requestants
         """
         self.servant.serviceConnects()
-        self.pruneConnections()
         for ca, ix in list(self.servant.ixes.items()):  # ixes changes during iteration
-            # check for and handle cutoff connections by client here
+            if ix.cutoff:  # closed by peer
+                self.closeConnection(ca)
+                continue
 
             if ca not in self.stewards:
                 self.stewards[ca] = Steward(remoter=ix, dictable=self.dictable)
@@ -1372,8 +1401,7 @@ class BareServer():
         arrived on connection ix at ca
         """
         steward = self.stewards.get(ca)
-        return (bool(ix.rxbs)
-                or bool(steward is not None and steward.requestant.started))
+        return requestUnderway(ix, steward.requestant if steward else None)
 
 
     def responding(self, ca, ix):

@@ -14,10 +14,11 @@ must measure idle tyme from the latest byte, must not cut a response in
 progress, must not crash a server serviced without a Tymist, and must also
 reach TLS connections that never finish their handshake.
 
-Ports 6431-6458 are used only here.
+Ports 6431-6463 are used only here.
 """
 import os
 import socket
+import struct
 import time
 
 import pytest
@@ -706,5 +707,184 @@ def test_http_server_applies_explicit_tymeout_to_held_connections():
             assert cx.tymeout == 1.0
             _advance(servant, tymist, 5)
             assert not servant.cxes  # handshake deadline now applies
+        finally:
+            sock.close()
+
+
+def test_server_timeouts_off_by_default():
+    """
+    Every server timeout is opt in: tyme can jump during Doist catch up, so
+    a timeout on by default would drop healthy clients.
+    """
+    assert http.Server.Tymeout == 0.0
+    assert http.Server.KeepTymeout == 0.0
+    assert http.BareServer.Timeout == 0.0
+    assert http.BareServer.KeepTymeout == 0.0
+    assert http.Server(port=6463, app=_okApp).servant.tymeout == 0.0
+    assert http.BareServer(port=6463).servant.tymeout == 0.0
+
+
+def test_http_server_drops_stopped_reader_that_keeps_sending():
+    """
+    Received bytes do not count as send progress, so a peer that has stopped
+    reading cannot hold a stalled send open by trickling bytes.
+    """
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6458
+    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(), tymeout=1.0)
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        assert _serviceUntil(server, lambda: server.servant.ixes)
+        ix = next(iter(server.servant.ixes.values()))
+        ix.send = lambda data: 0  # reader takes nothing: every send blocks
+        sock.sendall(REQUEST)
+        assert _serviceUntil(server, lambda: server.reps and
+                             next(iter(server.reps.values())).ended)
+        assert ix.txbs
+
+        for _ in range(8):  # 2 s, a byte from the peer every tick
+            if not server.servant.ixes:
+                break
+            sock.sendall(b"X")
+            before = len(ix.rxbs)
+            _serviceUntil(server, lambda: len(ix.rxbs) > before or
+                          not server.servant.ixes, tries=20)
+            tymist.tick()
+            server.service()
+        assert not server.servant.ixes
+    finally:
+        sock.close()
+        server.close()
+
+
+def test_bare_server_removes_connection_closed_by_peer():
+    """BareServer removes a connection the peer has closed, as Server does."""
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6459
+    server = http.BareServer(port=port, tymth=tymist.tymen())
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        sock.sendall(b"GET /echo HTTP/1.1\r\nHost: loc\r\nContent-Length: 0\r\n\r\n")
+        data = _recvAll(sock, server, until=b'"method":"GET"')
+        assert data.startswith(b"HTTP/1.1 200 OK")
+        sock.close()
+        assert _serviceUntil(server, lambda: not server.servant.ixes)
+        assert not server.stewards
+    finally:
+        sock.close()
+        server.servant.close()
+
+
+def _tlsServer(port, **kwa):
+    certDirPath = localTestCertDirPath()
+    return tcp.openServer(cls=tcp.ServerTls,
+                          ha=("", port),
+                          keypath=os.path.join(certDirPath, 'server_key.pem'),
+                          certpath=os.path.join(certDirPath, 'server_cert.pem'),
+                          cafilepath=os.path.join(certDirPath, 'client.pem'),
+                          **kwa)
+
+
+def _acceptCx(servant):
+    for _ in range(50):
+        servant.serviceConnects()
+        if servant.cxes:
+            break
+        time.sleep(0.02)
+    assert servant.cxes
+    return next(iter(servant.cxes.values()))
+
+
+def test_tls_set_tymeout_keeps_handshake_deadline_from_accept():
+    """
+    Setting tymeout on a ServerTls changes the handshake deadline's length
+    but not its start, so it still counts from accept and setting it again
+    cannot extend it.
+    """
+    tymist = tyming.Tymist(tock=0.25)
+    with _tlsServer(6460, tymth=tymist.tymen(), tymeout=1.0) as servant:
+        sock = socket.create_connection(("127.0.0.1", 6460))
+        try:
+            _acceptCx(servant)
+            _advance(servant, tymist, 3)  # 0.75 s since accept
+            assert servant.cxes
+            servant.setTymeout(1.0)  # again
+            servant.setTymeout(1.0)
+            _advance(servant, tymist, 1)  # 1.0 s since accept
+            assert not servant.cxes
+        finally:
+            sock.close()
+
+
+def test_server_closes_replaced_remoter():
+    """
+    A new connection accepted at the same ca as one still held replaces it,
+    and the old remoter's socket is closed rather than leaked.
+    """
+    tymist = tyming.Tymist()
+    port = 6461
+    with tcp.openServer(tymth=tymist.tymen(), ha=("", port)) as server:
+        first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        first.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        first.bind(("127.0.0.1", 0))
+        local = first.getsockname()
+        first.connect(("127.0.0.1", port))
+        for _ in range(50):
+            server.serviceConnects()
+            if server.ixes:
+                break
+            time.sleep(0.02)
+        old = server.ixes[local]
+        # abort with RST so the local port is free at once, then reuse it
+        first.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        first.close()
+        second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        second.bind(local)
+        second.connect(("127.0.0.1", port))
+        try:
+            for _ in range(50):
+                server.serviceConnects()
+                if server.ixes[local] is not old:
+                    break
+                time.sleep(0.02)
+            assert server.ixes[local] is not old
+            assert old.cs is None  # closed, not just shut down
+        finally:
+            second.close()
+
+
+def test_tls_server_closes_remoter_replaced_on_handshake():
+    """
+    When a handshake completes for a ca that already has a connection in
+    .ixes, the old remoter is closed. Uses a stub for the completed handshake.
+    """
+    class Stub:
+        connected = True
+        aborted = False
+        def __init__(self, ca):
+            self.ca = ca
+        def handshake(self):
+            pass
+        def refresh(self):
+            pass
+        def close(self):
+            pass
+
+    tymist = tyming.Tymist()
+    with _tlsServer(6462, tymth=tymist.tymen()) as servant:
+        sock = socket.create_connection(("127.0.0.1", 6462))
+        try:
+            cx = _acceptCx(servant)
+            ca = cx.ca
+            servant.cxes.clear()
+            servant.ixes[ca] = cx  # as if its handshake had completed
+            stub = Stub(ca)
+            servant.cxes[ca] = stub  # a new connection at the same ca
+            servant.serviceCxes()
+            assert servant.ixes[ca] is stub
+            assert cx.cs is None  # old remoter closed
         finally:
             sock.close()
