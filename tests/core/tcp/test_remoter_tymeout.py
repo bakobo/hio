@@ -14,7 +14,7 @@ must measure idle tyme from the latest byte, must not cut a response in
 progress, must not crash a server serviced without a Tymist, and must also
 reach TLS connections that never finish their handshake.
 
-Ports 6431-6463 are used only here.
+Ports 6431-6466 are used only here.
 """
 import os
 import socket
@@ -888,3 +888,70 @@ def test_tls_server_closes_remoter_replaced_on_handshake():
             assert cx.cs is None  # old remoter closed
         finally:
             sock.close()
+
+
+def test_keep_tymeout_alone_bounds_request_receipt():
+    """With only keepTymeout set, a stalled request is dropped after it."""
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6464
+    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(), keepTymeout=1.0)
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: loc")  # headers never finish
+        assert _serviceUntil(server, lambda: server.servant.ixes)
+        _advance(server, tymist, 5)  # 1.25 s
+        assert not server.servant.ixes
+    finally:
+        sock.close()
+        server.close()
+
+
+def test_keep_tymeout_alone_bounds_stalled_send():
+    """With only keepTymeout set, a stopped reader is dropped after it."""
+    tymist = tyming.Tymist(tock=0.25)
+    port = 6465
+    server = http.Server(port=port, app=_okApp, tymth=tymist.tymen(), keepTymeout=1.0)
+    server.servant.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        assert _serviceUntil(server, lambda: server.servant.ixes)
+        ix = next(iter(server.servant.ixes.values()))
+        ix.send = lambda data: 0  # reader takes nothing
+        sock.sendall(REQUEST)
+        assert _serviceUntil(server, lambda: server.reps and
+                             next(iter(server.reps.values())).ended)
+        assert ix.txbs
+        _advance(server, tymist, 5)  # 1.25 s
+        assert not server.servant.ixes
+    finally:
+        sock.close()
+        server.close()
+
+
+def test_keep_tymeout_alone_bounds_tls_handshake():
+    """
+    With only keepTymeout set on an http.Server given a ServerTls servant, a
+    connection that never handshakes is dropped after keepTymeout.
+    """
+    certDirPath = localTestCertDirPath()
+    tymist = tyming.Tymist(tock=0.5)
+    port = 6466
+    servant = tcp.ServerTls(ha=("", port),
+                            keypath=os.path.join(certDirPath, 'server_key.pem'),
+                            certpath=os.path.join(certDirPath, 'server_cert.pem'),
+                            cafilepath=os.path.join(certDirPath, 'client.pem'))
+    server = http.Server(servant=servant, app=_okApp, keepTymeout=2.0)
+    server.wind(tymist.tymen())
+    server.reopen()
+    sock = socket.create_connection(("127.0.0.1", port))
+    try:
+        assert _serviceUntil(server, lambda: servant.cxes)
+        _advance(server, tymist, 3)  # 1.5 s
+        assert servant.cxes
+        _advance(server, tymist, 2)  # 2.5 s
+        assert not servant.cxes
+        assert not servant.ixes
+    finally:
+        sock.close()
+        server.close()

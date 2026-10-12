@@ -508,9 +508,10 @@ def openServer(cls=None, **kwa):
 def connectionExpired(ix, requesting, responding, keepTymeout):
     """
     Returns True if incoming connection ix should be dropped for inactivity.
-    The rules for Server and BareServer live here. Each phase uses ix.tymer,
-    which every byte received or sent restarts from now, and which also
-    restarts when bytes are queued on an empty .txbs.
+    The rules for Server and BareServer live here. The idle phases use
+    ix.tymer, which every byte received or sent restarts from now. The
+    stalled send phase uses ix.sendTymer, which only send progress and
+    queueing bytes onto an empty .txbs restart.
 
     Parameters:
         ix (tcp.Remoter): incoming connection, ix.tymeout is the tymeout
@@ -657,7 +658,10 @@ class Server():
                 request has arrived. None means Server.KeepTymeout. 0.0 means
                 never drop, which suits clients that hold one connection open
                 across long gaps and do not reconnect when the server closes
-                it.
+                it. When keepTymeout > 0.0 and the servant's tymeout is 0.0,
+                keepTymeout is also applied to the servant as its tymeout, so
+                it bounds request receipt, stalled sends and TLS handshakes
+                too; otherwise those phases would never expire.
 
         Attributes:
             .app is wsgi application callable
@@ -736,6 +740,8 @@ class Server():
 
         self.secured = secured
         self.servant = servant
+        if self.servant.tymeout <= 0.0 and self.keepTymeout > 0.0:
+            self.servant.setTymeout(self.keepTymeout)  # bound every phase
 
 
     def wind(self, tymth):
@@ -1198,6 +1204,12 @@ class BareServer():
     with timeout in the role of Server's tymeout and a steward waiting on its
     response as the response in progress.
 
+    A non-persistent connection (HTTP/1.0, or Connection: close) is closed
+    once its response has drained from txbs. Upstream closed it before
+    sending, so the response was lost. With the default timeouts a peer that
+    never reads its response therefore holds the connection; pass timeout to
+    bound that.
+
     Every timeout is off by default (0.0, never). Timeouts are measured in
     tyme, and when a Doist cycle runs slow the Doist runs catch up cycles
     back to back, so tyme can advance seconds in milliseconds of wall time.
@@ -1254,7 +1266,9 @@ class BareServer():
             already holds.
         keepTymeout = tymeout in seconds for dropping a connection with no
             request under way, fresh or between requests. None means
-            BareServer.KeepTymeout. 0.0 means never drop.
+            BareServer.KeepTymeout. 0.0 means never drop. When keepTymeout
+            > 0.0 and the servant's tymeout is 0.0, keepTymeout is also
+            applied to the servant as its tymeout, as for Server.
 
         """
         self.stewards = stewards if stewards is not None else dict()
@@ -1320,6 +1334,8 @@ class BareServer():
 
         self.secured = secured
         self.servant = servant
+        if self.servant.tymeout <= 0.0 and self.keepTymeout > 0.0:
+            self.servant.setTymeout(self.keepTymeout)  # bound every phase
 
 
     def wind(self, tymth):
